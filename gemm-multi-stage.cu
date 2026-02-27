@@ -77,9 +77,12 @@ gemm_multi_stage(void *Dptr, const void *Aptr, const void *Bptr, int m, int n,
   clear(tCrD);
 
   // gmem -cp.async-> shm -ldmatrix-> reg
+  // CPY means the element each thread owns
+  // CPY_M, CPY_K means the repeat times in the direction of M and K
   auto s2r_tiled_copy_a = make_tiled_copy_A(S2RCopyAtomA{}, tiled_mma);
   auto s2r_thr_copy_a = s2r_tiled_copy_a.get_slice(idx);
   auto tAsA = s2r_thr_copy_a.partition_S(sA);  // ? (CPY, CPY_M, CPY_K, kStage)
+  // tCrA_view is used for ldmatrix
   auto tCrA_view = s2r_thr_copy_a.retile_D(tCrA);  // ? (CPY, CPY_M, CPY_K)
 
   auto s2r_tiled_copy_b = make_tiled_copy_B(S2RCopyAtomB{}, tiled_mma);
@@ -99,6 +102,42 @@ gemm_multi_stage(void *Dptr, const void *Aptr, const void *Bptr, int m, int n,
   auto tBsB_copy =
       g2s_thr_copy_b.partition_D(sB);  // (CPY, CPY_N, CPY_K, kStage)
 
+  if(thread0()) {
+    // tiled mma 
+    cute::print(tiled_mma);
+    // cute::print_latex(tiled_mma);
+
+    // gm
+    printf("\n gA layout is \n");
+    cute::print(gA);
+    
+    printf("\n tAgA_copy layout is \n");
+    cute::print(tAgA_copy);
+
+    printf("\n tAsA_copy layout is \n");
+    cute::print(tAsA_copy);
+
+    // smem
+    printf("\n sA layout is \n");
+    cute::print(sA);
+
+    printf("\n tAsA layout is \n");
+    cute::print(tAsA);
+
+    // register
+    printf("\n tCrA layout is \n");
+    cute::print(tCrA);
+
+    printf("\n tCrA_view layout is \n");
+    cute::print(tCrA_view);
+
+    // tile copy thread num is same as tiled_mma
+    int num_threads = cute::size(tiled_mma);
+    printf("s2r_tiled_copy_a thread num is : %d\n", num_threads);
+
+    printf("\n");
+  }
+  
   int itile_to_read = 0;
   int ismem_read = 0;
   int ismem_write = 0;
@@ -111,6 +150,15 @@ gemm_multi_stage(void *Dptr, const void *Aptr, const void *Bptr, int m, int n,
                tAsA_copy(_, _, _, istage));
     cute::copy(g2s_tiled_copy_b, tBgB_copy(_, _, _, istage),
                tBsB_copy(_, _, _, istage));
+
+    if (thread0()) {
+      // assert(istage >= 0 && istage < cute::size<3>(tAgA_copy));
+      // printf("##### total stage is %d, current stage is %d\n", kStage, istage);
+      // printf("\n tAgA_copy layout is \n");
+      // cute::print(tAgA_copy(_, _, _, istage));
+      // printf("\n");
+    }
+
     cp_async_fence();
 
     ++itile_to_read;
@@ -234,6 +282,8 @@ struct GemmConfig {
       Swizzle<kShmLoadSwizzleB, kShmLoadSwizzleM, kShmLoadSwizzleS>{},
       make_layout(make_shape(Int<8>{}, Int<kTileK>{}),
                   make_stride(Int<kTileK>{}, Int<1>{}))));
+  
+  // use swizzle layout tile_to_shape
   using SmemLayoutA = decltype(
       tile_to_shape(SmemLayoutAtom{},
                     make_shape(Int<kTileM>{}, Int<kTileK>{}, Int<kStage>{})));
@@ -251,10 +301,11 @@ struct GemmConfig {
   static constexpr int kMmaEURepeatK = 1;
 
   using mma_atom_shape = mma_traits::Shape_MNK;
-  static constexpr int kMmaPM = 1 * kMmaEURepeatM * get<0>(mma_atom_shape{});
-  static constexpr int kMmaPN = 2 * kMmaEURepeatN * get<1>(mma_atom_shape{});
-  static constexpr int kMmaPK = 1 * kMmaEURepeatK * get<2>(mma_atom_shape{});
+  static constexpr int kMmaPM = 1 * kMmaEURepeatM * get<0>(mma_atom_shape{});  // 32
+  static constexpr int kMmaPN = 2 * kMmaEURepeatN * get<1>(mma_atom_shape{});  // 32
+  static constexpr int kMmaPK = 1 * kMmaEURepeatK * get<2>(mma_atom_shape{});  // 16
 
+  // MMA_EU_RepeatT influnce register extend
   using MMA_EU_RepeatT = decltype(make_layout(make_shape(
       Int<kMmaEURepeatM>{}, Int<kMmaEURepeatN>{}, Int<kMmaEURepeatK>{})));
   using MMA_P_T = Tile<Int<kMmaPM>, Int<kMmaPN>, Int<kMmaPK>>;
@@ -284,6 +335,8 @@ struct GemmConfig {
   using SmemLayoutAtomC = decltype(composition(
       Swizzle<2, 3, 3>{}, make_layout(make_shape(Int<kMmaPM>{}, Int<kMmaPN>{}),
                                       make_stride(Int<kMmaPN>{}, Int<1>{}))));
+  
+  // TODO kSmemLayoutCBatch role
   using SmemLayoutC = decltype(tile_to_shape(
       SmemLayoutAtomC{},
       make_shape(Int<kMmaPM>{}, Int<kMmaPN>{}, Int<kSmemLayoutCBatch>{})));
@@ -326,13 +379,13 @@ int main(int argc, char *argv[]) {
   printf("cuBLAS version: %d\n", cublas_version);
 
   // default;
-  int M = 81920;
-  int N = 256;
-  int K = 256;
+  int M = 128;
+  int N = 128;
+  int K = 32;
 
   int enable_cpu = 0;
   int enable_cublaslt = 1;
-  int nt = 11;
+  int nt = 1;
 
   using ComputeType = T;
 
@@ -385,7 +438,7 @@ int main(int argc, char *argv[]) {
 
   config::GemmConfig<T, 128, 128, 32, 3> gemm_config;
 
-  print(typename decltype(gemm_config)::MMA{});
+  // print(typename decltype(gemm_config)::MMA{});
 
   dim3 block = gemm_config.kThreadNum;
   dim3 grid((N + gemm_config.kTileN - 1) / gemm_config.kTileN,
@@ -394,6 +447,11 @@ int main(int argc, char *argv[]) {
 
   half alpha = 1.f;
   half beta = 0.f;
+
+  printf("kThreadNum is %d\n", gemm_config.kThreadNum);
+  printf("kMmaPM is %d\n", gemm_config.kMmaPM);
+  printf("kMmaPN is %d\n", gemm_config.kMmaPN);
+  printf("kMmaPK is %d\n", gemm_config.kMmaPK);
 
   for (int it = 0; it < nt; ++it) {
     // blas
